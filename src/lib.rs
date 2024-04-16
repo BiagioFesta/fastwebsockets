@@ -167,8 +167,13 @@ pub mod upgrade;
 use bytes::Buf;
 
 use bytes::BytesMut;
-#[cfg(feature = "unstable-split")]
+
 use std::future::Future;
+use std::pin::pin;
+use std::pin::Pin;
+use std::task::ready;
+use std::task::Context;
+use std::task::Poll;
 
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
@@ -629,24 +634,51 @@ impl ReadHalf {
     }
   }
 
-  async fn parse_frame_header<'a, S>(
-    &mut self,
-    stream: &mut S,
-  ) -> Result<Frame<'a>, WebSocketError>
+  fn parse_frame_header<'a, S>(
+    &'a mut self,
+    stream: &'a mut S,
+  ) -> ParserFrameHeader<'a, S>
   where
     S: AsyncRead + Unpin,
   {
-    macro_rules! eof {
-      ($n:expr) => {{
-        if $n == 0 {
-          return Err(WebSocketError::UnexpectedEOF);
-        }
-      }};
-    }
+    ParserFrameHeader::new(stream, &mut self.buffer, self.max_message_size)
+  }
+}
 
+struct ParserFrameHeader<'a, S> {
+  state: ParserFrameHeaderState,
+  stream: &'a mut S,
+  buffer: &'a mut BytesMut,
+  max_message_size: usize,
+}
+
+impl<'a, S> ParserFrameHeader<'a, S>
+where
+  S: AsyncRead + Unpin,
+{
+  fn new(
+    stream: &'a mut S,
+    buffer: &'a mut BytesMut,
+    max_message_size: usize,
+  ) -> Self {
+    Self {
+      state: ParserFrameHeaderState::Init,
+      stream,
+      buffer,
+      max_message_size,
+    }
+  }
+
+  fn poll_init(
+    &mut self,
+    cx: &mut Context<'_>,
+  ) -> Poll<Result<(), WebSocketError>> {
     // Read the first two bytes
     while self.buffer.remaining() < 2 {
-      eof!(stream.read_buf(&mut self.buffer).await?);
+      let read_buf = pin!(self.stream.read_buf(self.buffer));
+      if ready!(Future::poll(read_buf, cx))? == 0 {
+        return Poll::Ready(Err(WebSocketError::UnexpectedEOF));
+      }
     }
 
     let fin = self.buffer[0] & 0b10000000 != 0;
@@ -655,7 +687,7 @@ impl ReadHalf {
     let rsv3 = self.buffer[0] & 0b00010000 != 0;
 
     if rsv1 || rsv2 || rsv3 {
-      return Err(WebSocketError::ReservedBitsNotZero);
+      return Poll::Ready(Err(WebSocketError::ReservedBitsNotZero));
     }
 
     let opcode = frame::OpCode::try_from(self.buffer[0] & 0b00001111)?;
@@ -669,8 +701,40 @@ impl ReadHalf {
     };
 
     self.buffer.advance(2);
+    self.state = ParserFrameHeaderState::PayloadLen {
+      fin,
+      opcode,
+      masked,
+      length_code,
+      extra,
+    };
+
+    Poll::Ready(Ok(()))
+  }
+
+  fn poll_payload_len(
+    &mut self,
+    cx: &mut Context<'_>,
+  ) -> Poll<Result<(), WebSocketError>>
+  where
+    S: AsyncRead + Unpin,
+  {
+    let ParserFrameHeaderState::PayloadLen {
+      fin,
+      opcode,
+      masked,
+      length_code,
+      extra,
+    } = self.state
+    else {
+      unreachable!()
+    };
+
     while self.buffer.remaining() < extra + masked as usize * 4 {
-      eof!(stream.read_buf(&mut self.buffer).await?);
+      let read_buf = pin!(self.stream.read_buf(&mut self.buffer));
+      if ready!(Future::poll(read_buf, cx))? == 0 {
+        return Poll::Ready(Err(WebSocketError::UnexpectedEOF));
+      }
     }
 
     let payload_len: usize = match extra {
@@ -698,28 +762,102 @@ impl ReadHalf {
     };
 
     if frame::is_control(opcode) && !fin {
-      return Err(WebSocketError::ControlFrameFragmented);
+      return Poll::Ready(Err(WebSocketError::ControlFrameFragmented));
     }
 
     if opcode == OpCode::Ping && payload_len > 125 {
-      return Err(WebSocketError::PingFrameTooLarge);
+      return Poll::Ready(Err(WebSocketError::PingFrameTooLarge));
     }
 
     if payload_len >= self.max_message_size {
-      return Err(WebSocketError::FrameTooLarge);
+      return Poll::Ready(Err(WebSocketError::FrameTooLarge));
     }
+
+    self.state = ParserFrameHeaderState::Payload {
+      fin,
+      opcode,
+      mask,
+      payload_len,
+    };
+
+    Poll::Ready(Ok(()))
+  }
+
+  fn poll_payload(
+    &mut self,
+    cx: &mut Context<'_>,
+  ) -> Poll<Result<Frame<'static>, WebSocketError>>
+  where
+    S: AsyncRead + Unpin,
+  {
+    let ParserFrameHeaderState::Payload {
+      fin,
+      opcode,
+      mask,
+      payload_len,
+    } = self.state
+    else {
+      unreachable!()
+    };
 
     // Reserve a bit more to try to get next frame header and avoid a syscall to read it next time
     self.buffer.reserve(payload_len + MAX_HEADER_SIZE);
     while payload_len > self.buffer.remaining() {
-      eof!(stream.read_buf(&mut self.buffer).await?);
+      let read_buf = pin!(self.stream.read_buf(&mut self.buffer));
+      if ready!(Future::poll(read_buf, cx))? == 0 {
+        return Poll::Ready(Err(WebSocketError::UnexpectedEOF));
+      }
     }
 
     // if we read too much it will stay in the buffer, for the next call to this method
     let payload = self.buffer.split_to(payload_len);
     let frame = Frame::new(fin, opcode, mask, Payload::Bytes(payload));
-    Ok(frame)
+    Poll::Ready(Ok(frame))
   }
+}
+
+impl<'a, S> Future for ParserFrameHeader<'a, S>
+where
+  S: AsyncRead + Unpin,
+{
+  type Output = Result<Frame<'static>, WebSocketError>;
+
+  fn poll(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+  ) -> Poll<Self::Output> {
+    loop {
+      match self.state {
+        ParserFrameHeaderState::Init => {
+          ready!(self.poll_init(cx))?;
+        }
+        ParserFrameHeaderState::PayloadLen { .. } => {
+          ready!(self.poll_payload_len(cx))?;
+        }
+        ParserFrameHeaderState::Payload { .. } => {
+          return self.poll_payload(cx);
+        }
+      }
+    }
+  }
+}
+
+#[derive(Debug)]
+enum ParserFrameHeaderState {
+  Init,
+  PayloadLen {
+    fin: bool,
+    opcode: frame::OpCode,
+    masked: bool,
+    length_code: u8,
+    extra: usize,
+  },
+  Payload {
+    fin: bool,
+    opcode: frame::OpCode,
+    mask: Option<[u8; 4]>,
+    payload_len: usize,
+  },
 }
 
 impl WriteHalf {
